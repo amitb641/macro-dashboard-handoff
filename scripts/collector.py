@@ -1,0 +1,600 @@
+#!/usr/bin/env python3
+"""
+Agent 1 — COLLECTOR
+Pulls all macro series from FRED, BLS, EIA APIs.
+Runs daily Mon–Fri at 7am ET via GitHub Actions.
+No LLM. Output: data/raw_data.json
+
+Daily series (refresh every run):
+  FRED: yields, spreads, oil, mortgage
+  EIA:  WTI + Brent daily spot
+
+Weekly series (refresh Thursdays only):
+  FRED: initial jobless claims (ICSA), continued claims (CCSA)
+
+Monthly series (latest available):
+  FRED: unemployment, CPI, PCE, wages, saving rate, housing, GDP
+  BLS:  sector payrolls
+"""
+
+import os, json, datetime, sys, time
+from pathlib import Path
+
+try:
+    import requests
+except ImportError:
+    print("pip install requests"); sys.exit(1)
+
+FRED_KEY = os.environ.get('FRED_API_KEY', '')
+BLS_KEY  = os.environ.get('BLS_API_KEY',  '')
+EIA_KEY  = os.environ.get('EIA_API_KEY',  '')
+
+ROOT     = Path(__file__).parent.parent
+OUT_FILE = ROOT / 'data' / 'raw_data.json'
+
+errors = []
+
+
+# ── FRED ──────────────────────────────────────────────────────────────
+
+def fred_obs(series_id, limit=14, freq=None):
+    """Return list of {date,value} newest first, no missing values.
+    Retries up to 3 times with exponential backoff on 5xx and 429 (rate
+    limit) errors. FRED's documented limit is 120 req/min per key; pre-flight
+    + bulk fetch can briefly push past that, so we wait it out."""
+    if not FRED_KEY:
+        errors.append(f'FRED key missing — skipped {series_id}'); return []
+    params = {'series_id': series_id, 'api_key': FRED_KEY,
+              'file_type': 'json', 'sort_order': 'desc', 'limit': limit}
+    if freq: params['frequency'] = freq
+    last_err = None
+    for attempt in range(4):  # 0, 1, 2, 3
+        try:
+            r = requests.get('https://api.stlouisfed.org/fred/series/observations',
+                             params=params, timeout=15)
+            r.raise_for_status()
+            return [{'date': o['date'], 'value': float(o['value'])}
+                    for o in r.json().get('observations', []) if o['value'] != '.']
+        except requests.exceptions.HTTPError as e:
+            last_err = e
+            if r.status_code == 429 and attempt < 3:
+                # Rate limited — wait long enough to fall out of FRED's 60s window
+                wait = 30 * (attempt + 1)  # 30s, 60s, 90s
+                print(f'    ↻ FRED {series_id}: 429 rate limited, retry {attempt+1}/3 in {wait}s')
+                time.sleep(wait)
+                continue
+            if r.status_code >= 500 and attempt < 3:
+                wait = 2 ** attempt  # 1s, 2s, 4s
+                print(f'    ↻ FRED {series_id}: {r.status_code}, retry {attempt+1}/3 in {wait}s')
+                time.sleep(wait)
+                continue
+            break
+        except Exception as e:
+            last_err = e; break
+    errors.append(f'FRED {series_id}: {last_err}'); return []
+
+def fv(sid, limit=14):
+    d = fred_obs(sid, limit); return d[0] if d else None
+
+
+# ── ALFRED (vintage-pinned FRED) ──────────────────────────────────────
+# See METHODOLOGY.md §5 for the vintage-pinning rationale.
+
+def last_quarter_end(today=None):
+    """End date of the previous quarter, as YYYY-MM-DD string.
+    e.g. if today=2026-04-20 (Q2) → '2026-03-31'."""
+    from calendar import monthrange
+    today = today or datetime.date.today()
+    quarter_of = (today.month - 1) // 3 + 1  # 1..4
+    if quarter_of == 1:
+        y, m = today.year - 1, 12
+    else:
+        y = today.year
+        m = (quarter_of - 1) * 3  # 3, 6, 9
+    return f'{y}-{m:02d}-{monthrange(y, m)[1]:02d}'
+
+
+def fred_alfred_obs(series_id, vintage_date, limit=14, freq=None):
+    """Pull AS-OF-vintage observations from ALFRED.
+    Returns values exactly as they were published on `vintage_date` — no
+    subsequent revisions. Falls back to [] on any failure so callers can
+    degrade to unpinned data without breaking the pipeline.
+    See https://alfred.stlouisfed.org/docs/api/alfred/"""
+    if not FRED_KEY:
+        errors.append(f'FRED key missing — ALFRED skipped {series_id}'); return []
+    params = {'series_id': series_id, 'api_key': FRED_KEY,
+              'file_type': 'json', 'sort_order': 'desc', 'limit': limit,
+              'realtime_start': vintage_date, 'realtime_end': vintage_date}
+    if freq: params['frequency'] = freq
+    try:
+        r = requests.get('https://api.stlouisfed.org/fred/series/observations',
+                         params=params, timeout=15)
+        r.raise_for_status()
+        return [{'date': o['date'], 'value': float(o['value'])}
+                for o in r.json().get('observations', []) if o['value'] != '.']
+    except Exception as e:
+        errors.append(f'ALFRED {series_id}@{vintage_date}: {e}'); return []
+
+
+# ── UMich Survey of Consumers (direct) ───────────────────────────────
+
+_UMICH_MONTHS = {'January':1,'February':2,'March':3,'April':4,'May':5,'June':6,
+                 'July':7,'August':8,'September':9,'October':10,'November':11,'December':12}
+
+def umich_fetch():
+    """Fetch monthly Consumer Sentiment Index direct from UMich.
+
+    Parses tbcics.csv (~13 months). Preliminary releases are marked in
+    column 0 as e.g. 'April (P)' — we surface that as status='preliminary'
+    so the dashboard can badge it. Publishing cadence is prelim mid-month,
+    final end-of-month; FRED republishes final only with a ~1 month lag,
+    so the direct source gives us ~2–6 weeks earlier visibility.
+    """
+    url = 'https://www.sca.isr.umich.edu/files/tbcics.csv'
+    headers = {'User-Agent': 'Mozilla/5.0 (compatible; MacroDashboard/1.0)'}
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        r.raise_for_status()
+        rows = []
+        for line in r.text.splitlines():
+            parts = [p.strip() for p in line.split(',')]
+            if len(parts) < 5 or not parts[0] or not parts[1].isdigit():
+                continue
+            raw = parts[0]
+            is_prelim = '(P)' in raw
+            month_name = raw.replace('(P)', '').strip()
+            if month_name not in _UMICH_MONTHS:
+                continue
+            try:
+                value = float(parts[4])
+            except ValueError:
+                continue
+            date = f"{parts[1]}-{_UMICH_MONTHS[month_name]:02d}-01"
+            rows.append({'date': date, 'value': value,
+                         'status': 'preliminary' if is_prelim else 'final'})
+        rows.sort(key=lambda r: r['date'], reverse=True)
+        return rows
+    except Exception as e:
+        errors.append(f'UMich direct: {e}'); return []
+
+
+# ── BLS ───────────────────────────────────────────────────────────────
+
+def bls_fetch(series_ids):
+    if not BLS_KEY: errors.append('BLS key missing'); return {}
+    yr = datetime.date.today().year
+    try:
+        r = requests.post('https://api.bls.gov/publicAPI/v2/timeseries/data/', json={
+            'seriesid': series_ids, 'startyear': str(yr - 2), 'endyear': str(yr),
+            'registrationkey': BLS_KEY, 'annualaverage': True}, timeout=20)
+        r.raise_for_status()
+        body = r.json()
+        if body.get('status') != 'REQUEST_SUCCEEDED':
+            errors.append(f'BLS: {body.get("message","")}'); return {}
+        return {s['seriesID']: s['data'] for s in body['Results']['series']}
+    except Exception as e:
+        errors.append(f'BLS: {e}'); return {}
+
+
+# ── EIA ───────────────────────────────────────────────────────────────
+
+def eia_spot(product, days=35):
+    """EIA daily spot. product: RWTC=WTI, RBRTE=Brent. 35 days = current month + buffer."""
+    if not EIA_KEY: return []
+    url = (f'https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key={EIA_KEY}'
+           f'&frequency=daily&data[0]=value&facets[series][]={product}'
+           f'&sort[0][column]=period&sort[0][direction]=desc&length={days}')
+    try:
+        r = requests.get(url, timeout=15); r.raise_for_status()
+        return [{'date': d['period'], 'value': float(d['value'])}
+                for d in r.json()['response']['data'] if d['value']]
+    except Exception as e:
+        errors.append(f'EIA {product}: {e}'); return []
+
+
+# ── Build OIL_DAILY for current month ────────────────────────────────
+
+def build_oil_daily(wti_series, brent_series):
+    """
+    Extract daily sessions from EIA/FRED data starting March 1 of the
+    current year.  Tracks the full oil-price trajectory through the year.
+    """
+    today = datetime.date.today()
+    start_date = datetime.date(today.year, 3, 1)
+
+    def filter_from(series):
+        out = []
+        for obs in reversed(series):  # oldest first
+            d = datetime.date.fromisoformat(obs['date'])
+            if d >= start_date:
+                out.append({'date': d, 'value': obs['value']})
+        return out
+
+    wti_m   = filter_from(wti_series)
+    brent_m = filter_from(brent_series)
+
+    # Align by date
+    wti_by_date   = {o['date']: o['value'] for o in wti_m}
+    brent_by_date = {o['date']: o['value'] for o in brent_m}
+    all_dates = sorted(set(list(wti_by_date.keys()) + list(brent_by_date.keys())))
+
+    labels = []
+    wti_vals = []
+    brent_vals = []
+
+    for d in all_dates:
+        labels.append(f"{d.strftime('%b')} {d.day}")  # portable (no %-d, glibc-only on Windows)
+        wti_vals.append(wti_by_date.get(d) or (wti_vals[-1] if wti_vals else None))
+        brent_vals.append(brent_by_date.get(d) or (brent_vals[-1] if brent_vals else None))
+
+    # Auto-generate move annotations: flag any day with |change| >= $2.50/bbl
+    notes = []
+    for i, wti in enumerate(wti_vals):
+        if wti is None or i == 0:
+            notes.append(None)
+            continue
+        prev = next((wti_vals[j] for j in range(i-1, -1, -1) if wti_vals[j] is not None), None)
+        if prev is None:
+            notes.append(None)
+            continue
+        chg = wti - prev
+        if abs(chg) >= 2.50:
+            direction = 'surge' if chg > 0 else 'drop'
+            pct = abs(chg / prev * 100)
+            notes.append(f'WTI {direction} ${abs(chg):.1f} ({pct:.1f}%) — pipeline updates this field with market headlines')
+        else:
+            notes.append(None)
+
+    return {
+        'labels':   labels,
+        'wti':      wti_vals,
+        'brent':    brent_vals,
+        'notes':    notes,
+        'month':    f'Mar–{today.strftime("%b %Y")}',
+        'updated':  datetime.datetime.utcnow().strftime('%b %d %H:%M UTC'),
+        'sessions': len([v for v in wti_vals if v is not None]),
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════
+
+def check_oil_window_coverage(wti_raw, brent_raw, today=None):
+    """Regression guard for the OIL_DAILY fetch-window bug (fixed 2026-09-28):
+    a fixed observation-count fetch silently drifted away from covering
+    "since March 1" as the calendar moved further from March. Returns a
+    list of error strings (empty when the window genuinely reaches back to
+    Mar 1 of `today`'s year, within a 5-day tolerance for weekends/holidays
+    at the boundary). Standalone/pure so it's unit-testable without live
+    API keys -- see tests/test_smoke.py::test_oil_window_coverage.
+    """
+    today = today or datetime.date.today()
+    start = datetime.date(today.year, 3, 1)
+    earliest = None
+    for obs in (wti_raw or []) + (brent_raw or []):
+        try:
+            d = datetime.date.fromisoformat(obs['date'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if earliest is None or d < earliest:
+            earliest = d
+    if earliest is not None and earliest > start + datetime.timedelta(days=5):
+        return [
+            f'OIL_DAILY window too short: earliest fetched oil observation is '
+            f'{earliest.isoformat()}, expected to reach back to {start.isoformat()} '
+            f'(Mar 1) -- the chart\'s "Since Mar 2026" claim is no longer true. '
+            f'Check _oil_fetch_days in collect().'
+        ]
+    return []
+
+
+def collect():
+    print('[Agent 1 — Collector] Starting...')
+    ts   = datetime.datetime.utcnow().isoformat() + 'Z'
+    data = {}
+
+    # ── Daily: rates, spreads, oil ────────────────────────────────────
+    print('  [Daily] Rates + Yields...')
+    data['dff']         = fv('DFF')
+    # 'ffr' (the "Fed Funds Rate" headline KPI, read by renderer/analyzer/
+    # briefing_agent/publisher/validator/monthly_archive/etc. -- see the
+    # CLAUDE.md gotcha for the full list) aliases the daily DFF value
+    # rather than fetching FEDFUNDS (the monthly average). Found 2026-09-28
+    # via a user report ("fed rate not updated"): FEDFUNDS's reference date
+    # is always the 1st of the month and can legitimately lag up to ~58
+    # days behind the same-day DGS2/DGS10/etc. tiles it's displayed next
+    # to on the Fed Rates tab -- the headline tile was showing August's
+    # 3.63% average while the real, current daily rate (DFF) had already
+    # moved to 3.88% (a genuine 25bp FOMC move the monthly average hadn't
+    # caught up to yet), not a fetch failure. No duplicate API call: reuse
+    # the DFF fetch immediately above instead of a second fv('FEDFUNDS').
+    data['ffr']         = data['dff']
+    data['dgs2']        = fv('DGS2')
+    data['dgs5']        = fv('DGS5')
+    data['dgs10']       = fv('DGS10')
+    data['dgs30']       = fv('DGS30')
+    data['dgs10_hist']  = fred_obs('DGS10', 60)
+    data['dgs2_hist']   = fred_obs('DGS2',  60)
+
+    print('  [Daily] Credit Spreads...')
+    data['ig_oas']      = fv('BAMLC0A0CM')
+    data['hy_oas']      = fv('BAMLH0A0HYM2')
+    data['ig_hist']     = fred_obs('BAMLC0A0CM',   60)
+    data['hy_hist']     = fred_obs('BAMLH0A0HYM2', 60)
+
+    print('  [Daily] Oil (EIA + FRED fallback)...')
+    # Fixed 60-day fetch used to "cover from Mar 1" only because this was
+    # written close to March -- by Sep 28 2026, 60 trading days back only
+    # reaches late June, silently truncating build_oil_daily()'s Mar 1
+    # filter input and losing ~4 months of the shock-tracker's own claimed
+    # history (found via a user report that the chart's own date range had
+    # quietly drifted off its "Since Mar 2026" banner). Compute the window
+    # from the actual calendar gap instead of a static guess, so it keeps
+    # covering Mar 1 onward no matter how long the shock window runs.
+    _oil_fetch_days = (datetime.date.today() - datetime.date(datetime.date.today().year, 3, 1)).days + 10
+    wti_raw   = eia_spot('RWTC',  _oil_fetch_days)
+    brent_raw = eia_spot('RBRTE', _oil_fetch_days)
+    if not wti_raw:   wti_raw   = fred_obs('DCOILWTICO',   _oil_fetch_days)
+    if not brent_raw: brent_raw = fred_obs('DCOILBRENTEU', _oil_fetch_days)
+    data['wti_daily']    = wti_raw
+    data['brent_daily']  = brent_raw
+    data['oil_daily_chart'] = build_oil_daily(wti_raw, brent_raw)  # Mar 1 onward
+    # Self-check: confirm the fetch actually reached back to Mar 1 instead of
+    # trusting the fixed-window bug above to never recur silently the same
+    # way. Surfaced as a collector error so Pass 3h (validator) catches a
+    # regression in CI instead of waiting for a user to notice a chart.
+    # (Looping .append() rather than .extend() -- _ErrList only overrides
+    # append() to scrub secrets; list.extend() is inherited unscrubbed.)
+    for _err in check_oil_window_coverage(wti_raw, brent_raw):
+        errors.append(_err)
+
+    print('  [Weekly] Gasoline + Mortgage...')
+    data['gasoline']    = fred_obs('GASREGW', 30)     # Weekly retail gasoline $/gal (EIA via FRED)
+    data['mortgage30']  = fred_obs('MORTGAGE30US', 70)   # ~14 months weekly for 12-month chart
+    data['mortgage15']  = fred_obs('MORTGAGE15US', 70)
+
+    # ── Monthly: labor, inflation, housing, GDP ───────────────────────
+    # Pull 320 observations (~26 years) to build charts from 2000
+    # ── Weekly: jobless claims (DOL releases Thursdays) ───────────────
+    # Always fetch fresh. Previously gated on `date.today().weekday()==3`
+    # (Thursday) with a "carry forward" fallback otherwise — but this
+    # pipeline's only schedule is Saturday (`0 12 * * 6` in briefing.yml /
+    # briefing-dev.yml), so weekday() was never 3 on any real scheduled
+    # run and the carry-forward branch fired unconditionally, every run,
+    # forever freezing ICSA/CCSA at whatever value happened to exist from
+    # the last manual run that landed on an actual calendar Thursday.
+    # Found 2026-08 via a live-site staleness report ("Initial Claims
+    # May'26" months after the fact) despite preflight independently
+    # confirming FRED had current data ("ICSA: 200 OK, latest 2026-08-15")
+    # every single one of those runs — the data was available, this gate
+    # just never let the collector ask for it. Given the pipeline runs
+    # weekly (not daily), there's no meaningful API-call cost this gate
+    # was saving; removed outright rather than re-tuned to a different day.
+    print('  [Weekly] Jobless Claims...')
+    data['icsa']    = fred_obs('ICSA',       260)   # weekly initial claims ~5 years
+    data['ccsa']    = fred_obs('CCSA',       260)   # weekly continued claims ~5 years
+
+    print('  [Monthly] Labor...')
+    data['unrate']      = fred_obs('UNRATE',     480)
+    data['u6rate']      = fred_obs('U6RATE',     14)
+    data['payems']      = fred_obs('PAYEMS',     480)
+    data['ahetpi']      = fred_obs('AHETPI',     480)
+    # ADP National Employment Report — Total Nonfarm Private, MoM change (SA, K).
+    # FRED NPPTTL was discontinued 2022-05 after ADP methodology revamp.
+    # Fetched so renderer can detect a future series revival; renderer applies an
+    # 18-month recency filter — stale obs fall through to prior-state.json round-trip.
+    data['adp_nppttl']  = fred_obs('NPPTTL',     24)
+    # ADP live scrape — adpemploymentreport.com/ner_production.json returns the
+    # latest monthly headline as structured JSON (no browser needed).
+    # Gives one data point: current month. Historical months accumulate via
+    # prior-state.json round-trip in the renderer.
+    try:
+        _adp_r = requests.get('https://adpemploymentreport.com/ner_production.json',
+                              timeout=10, headers={'User-Agent': 'macro-dashboard/1.0'})
+        _adp_r.raise_for_status()
+        _adp_j = _adp_r.json()
+        # metricValue is raw headcount e.g. "109,000" — divide by 1000 to get K
+        _adp_val = round(int(_adp_j['reportOverview']['cards'][0]['metricValue'].replace(',', '')) / 1000)
+        _adp_mon = _adp_j.get('reportMonth', '')   # e.g. "April"
+        _adp_yr  = str(_adp_j.get('reportYear', ''))  # e.g. "2026"
+        _adp_dt  = datetime.datetime.strptime(f'{_adp_mon} {_adp_yr}', '%B %Y')
+        data['adp_latest'] = {
+            'value': _adp_val,
+            'label': _adp_dt.strftime("%b'%y"),  # "Apr'26"
+            'month': _adp_mon,
+            'year':  _adp_yr,
+        }
+        print(f'✅ ADP latest: {_adp_val:+,}K ({_adp_mon} {_adp_yr})')
+    except Exception as _adp_err:
+        data['adp_latest'] = None
+        print(f'⚠️  ADP latest fetch failed: {_adp_err}')
+    # Atlanta Fed Wage Growth Tracker — 3-Month MA, Unweighted Median, Hourly,
+    # Overall. Measures wage growth for workers continuously employed over 12
+    # months (controls for composition effects that bias AHETPI).
+    # Used as the headline wage growth KPI; AHETPI retained for level charts
+    # and sector breakdowns (Atlanta Fed has no sector decomposition).
+    data['wage_growth_atl'] = fred_obs('FRBATLWGT3MMAUMHWGO', 60)
+    data['jolts']       = fv('JTSJOL')
+    # UMich Consumer Sentiment: direct source gives prelim flag + fresher data;
+    # FRED fills history older than the direct CSV's 13-month window (all final).
+    umich_direct = umich_fetch()
+    if umich_direct:
+        fred_umcsent = fred_obs('UMCSENT', 30)
+        umich_dates = {r['date'] for r in umich_direct}
+        fred_extras = [{**f, 'status': 'final'} for f in fred_umcsent if f['date'] not in umich_dates]
+        data['umcsent'] = sorted(umich_direct + fred_extras, key=lambda r: r['date'], reverse=True)
+    else:
+        data['umcsent'] = [{**r, 'status': 'final'} for r in fred_obs('UMCSENT', 30)]
+    data['bls_sectors'] = bls_fetch([
+        'CES0000000001',  # Total Nonfarm
+        'CES1000000001',  # Mining & Energy (Mining and Logging)
+        'CES2000000001',  # Construction
+        'CES3000000001',  # Manufacturing
+        'CES4200000001',  # Retail Trade
+        'CES4300000001',  # Transportation & Warehousing
+        'CES5000000001',  # Information (Tech)
+        'CES5500000001',  # Financial Activities
+        'CES6000000001',  # Professional & Business Services
+        'CES6561000001',  # Education (Private)
+        'CES6562000001',  # Healthcare
+        'CES7000000001',  # Leisure & Hospitality
+        'CES9091000001',  # Federal Government
+        'CES9093000001',  # State & Local Government
+    ])
+
+    # Sector unemployment rates (BLS CPS) for U_SECTOR_MOM auto-rebuild.
+    # NOTE: BLS does not publish seasonally-adjusted (LNS14) sector unemployment
+    # rates by industry. LNU04 (not seasonally adjusted) is the only available
+    # series. 11 sectors — Hotel/Lodging and Restaurant are rolled into
+    # Leisure & Hospitality (LNU04032241).
+    print('  [Monthly] Sector Unemployment (CPS)...')
+    data['bls_unemp_sectors'] = bls_fetch([
+        'LNU04032231',  # Construction
+        'LNU04032232',  # Manufacturing
+        'LNU04032235',  # Wholesale & Retail Trade
+        'LNU04032236',  # Transport & Warehousing
+        'LNU04032237',  # Information/Tech
+        'LNU04032238',  # Financial Activities
+        'LNU04032239',  # Prof. & Biz Services
+        'LNU04032240',  # Healthcare & Education
+        'LNU04032241',  # Leisure & Hospitality
+        'LNU04032230',  # Agriculture & Mining
+        'LNU04028615',  # Government
+    ])
+
+    print('  [Monthly] Inflation...')
+    data['cpi_all']     = fred_obs('CPIAUCSL',  480)
+    data['cpi_core']    = fred_obs('CPILFESL',  480)
+    data['pce']         = fred_obs('PCEPI',     480)
+    data['pce_core']    = fred_obs('PCEPILFE',  480)
+    data['psavert']     = fred_obs('PSAVERT',   480)
+
+    # CPI category detail for CPI_CAT_MOM auto-rebuild.
+    # All categories need >=13 obs so renderer's _yoy_from_index can compute
+    # latest YoY (current month + same month a year ago). 24 leaves headroom
+    # for the shock tracker's pre-shock baselines.
+    print('  [Monthly] CPI Categories (FRED)...')
+    data['cpi_shelter']   = fred_obs('CUSR0000SAH1', 24)  # Shelter
+    # 30 obs leaves margin above the 24 that the shock-tracker YoY+pre-shock
+    # math requires (13 YoY + ~11 buffer); avoids borderline n=23 from FRED lag.
+    data['cpi_food_away'] = fred_obs('CUSR0000SEFV', 30)  # Food Away from Home
+    # 2026-07-25: was CUSR0000SETG ("Public Transportation" -- a narrow,
+    # airfare-heavy basket) mislabeled as "Transportation Services" -- found
+    # via a user question about a 16.9% YoY reading that turned out to be
+    # real but for the wrong series (BLS's actual "Transportation services"
+    # line was 3.4% YoY the same month). SAS4 is BLS/FRED's real
+    # "Transportation Services" series, verified against BLS CPI Table 1.
+    data['cpi_transport'] = fred_obs('CUSR0000SAS4', 30)  # Transportation Services
+    data['cpi_medical']   = fred_obs('CUSR0000SAM2', 24)  # Medical Care Services
+    data['cpi_food_home'] = fred_obs('CUSR0000SAF11',24)  # Food at Home
+    data['cpi_new_veh']   = fred_obs('CUSR0000SETA01',24) # New Vehicles
+    data['cpi_apparel']   = fred_obs('CPIAPPSL',     24)  # Apparel (SA)
+    # cpi_energy bucket sources from cpiengsl above (CPIENGSL, 320 obs); no
+    # separate fetch needed. The bad CUSR0000SA0E ID returned 400s for months.
+    data['cpi_used_cars'] = fred_obs('CUSR0000SETA02',24) # Used Cars & Trucks
+
+    # PCE top-level component price indexes (BEA Table 2.3.4 via FRED) for
+    # PCE_CAT_MOM auto-rebuild. BEA only publishes monthly chain-type price
+    # indexes at the top-aggregate level — services sub-categories (housing,
+    # healthcare, recreation, etc.) are quarterly only. These 4 are the
+    # canonical decomposition of headline PCE: Goods + Services + Food +
+    # Energy goods & services. 24 obs so _yoy_from_index can compute YoY.
+    print('  [Monthly] PCE Components (FRED)...')
+    data['pce_goods']    = fred_obs('DGDSRG3M086SBEA', 24)  # Goods (aggregate)
+    data['pce_services'] = fred_obs('DSERRG3M086SBEA', 24)  # Services (aggregate)
+    data['pce_food']     = fred_obs('DFXARG3M086SBEA', 24)  # Food & Bev (off-premises)
+    data['pce_energy']   = fred_obs('DNRGRG3M086SBEA', 24)  # Energy goods & services
+
+    print('  [Monthly] Housing...')
+    data['houst']       = fred_obs('HOUST',      480)
+    data['houst1f']     = fred_obs('HOUST1F',    480)
+    data['permit']      = fred_obs('PERMIT',     480)
+    data['cs_hpi']      = fred_obs('CSUSHPISA',  480)
+
+    print('  [Quarterly] GDP + Credit...')
+    data['gdpc1']       = fred_obs('GDPC1',  12)
+    data['gdp_growth']  = fred_obs('A191RL1Q225SBEA', 12)
+    # Card 90+ DPD (DRCCLACBS) — quarterly Fed release. Pull ~27 yrs of
+    # history (108 obs) so renderer.rebuild_treasury_data can populate the
+    # TREASURY_DATA.card90 line from 2000 onward, not just the last 3 yrs.
+    data['cc_delinq']   = fred_obs('DRCCLACBS',  108)
+    data['mtg_delinq']  = fred_obs('DRSFRMACBS', 12)
+    data['tdsp']        = fred_obs('TDSP',   30)   # Household Debt Service Ratio (% of disp. income)
+
+    # ── Annual history for chart rebuilding (from 2000) ──────────────
+    print('  [History] Annual chart series...')
+    data['fedfunds_annual']   = fred_obs('FEDFUNDS', 40, freq='a')
+    data['mortgage30_annual'] = fred_obs('MORTGAGE30US', 40, freq='a')
+    data['dgs10_annual']      = fred_obs('DGS10', 40, freq='a')
+    data['dgs2_annual']       = fred_obs('DGS2', 40, freq='a')
+    # FRED's freq='a' aggregation only returns 2 obs for these daily series
+    # (cause unclear — works fine for FEDFUNDS). Fetch monthly instead and
+    # aggregate to annual averages locally in the renderer; gives full
+    # 30-year history reliably.
+    data['ig_oas_monthly']    = fred_obs('BAMLC0A0CM', 360, freq='m')
+    data['hy_oas_monthly']    = fred_obs('BAMLH0A0HYM2', 360, freq='m')
+    data['wti_annual']        = fred_obs('DCOILWTICO', 40, freq='a')
+    data['brent_annual']      = fred_obs('DCOILBRENTEU', 40, freq='a')
+    data['gdpc1_annual']      = fred_obs('GDPC1', 40, freq='a')
+    data['gdp_annual']        = fred_obs('GDP', 40, freq='a')
+    # Vintage-pinned copies for historical charts (see METHODOLOGY.md §5).
+    # Pin rolls forward each quarter. All pinned series share the same pin
+    # date so cross-series comparisons stay coherent within a pin cycle.
+    _pin = last_quarter_end()
+    data['gdpc1_annual_pinned'] = fred_alfred_obs('GDPC1',    _pin, 40,  freq='a')
+    data['gdp_annual_pinned']   = fred_alfred_obs('GDP',      _pin, 40,  freq='a')
+    # Monthly series feeding annual-aggregate charts (CPI_ANNUAL, JOBS_ANNUAL,
+    # WAGE_ANNUAL). Monthly/YoY current-period KPIs continue reading unpinned
+    # `cpi_all`, `payems`, `ahetpi` for freshness.
+    data['cpi_all_pinned']      = fred_alfred_obs('CPIAUCSL', _pin, 480)
+    data['payems_pinned']       = fred_alfred_obs('PAYEMS',   _pin, 480)
+    data['ahetpi_pinned']       = fred_alfred_obs('AHETPI',   _pin, 480)
+    data['pce_pinned']          = fred_alfred_obs('PCEPI',    _pin, 480)
+    data['pce_core_pinned']     = fred_alfred_obs('PCEPILFE', _pin, 480)
+    data['vintages'] = {
+        'gdpc1_annual': {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'gdp_annual':   {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'cpi_all':      {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'payems':       {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'ahetpi':       {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'pce':          {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+        'pce_core':     {'pin_date': _pin, 'refresh_cadence': 'quarterly'},
+    }
+    data['umcsent_annual']    = fred_obs('UMCSENT', 40, freq='a')
+    data['cpiengsl']          = fred_obs('CPIENGSL', 480)
+    data['revolsl_annual']    = fred_obs('REVOLSL', 40, freq='a')
+    data['nonrevsl_annual']   = fred_obs('NONREVSL', 40, freq='a')
+
+    # Monthly oil for OIL_MONTHLY chart (from 2000)
+    print('  [History] Monthly oil prices...')
+    data['wti_monthly']       = fred_obs('DCOILWTICO', 480, freq='m')
+    data['brent_monthly']     = fred_obs('DCOILBRENTEU', 480, freq='m')
+
+    # ── Carry forward: fill failed series from prior run ─────────────
+    try:
+        prior = json.loads(OUT_FILE.read_text()).get('data', {}) if OUT_FILE.exists() else {}
+    except (json.JSONDecodeError, OSError):
+        prior = {}
+    carried = 0
+    for key in data:
+        if not data[key] and key in prior and prior[key]:
+            data[key] = prior[key]
+            carried += 1
+    if carried:
+        print(f'  ℹ  Carried forward {carried} series from prior run')
+
+    # ── Package ───────────────────────────────────────────────────────
+    n_ok = sum(1 for v in data.values() if v)
+    OUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    OUT_FILE.write_text(json.dumps({
+        'collected_at': ts, 'series_count': n_ok,
+        'error_count': len(errors), 'errors': errors, 'data': data,
+    }, indent=2, default=str))
+
+    print(f'[Agent 1] Done: {n_ok}/{len(data)} series, {len(errors)} errors')
+    for e in errors: print(f'  ⚠  {e}')
+    # Succeed if we have data for most series (allow some FRED failures)
+    return n_ok >= len(data) * 0.6
+
+
+if __name__ == '__main__':
+    sys.exit(0 if collect() else 1)

@@ -1,0 +1,40 @@
+name: Smoke Tests
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - 'tests/**'
+      - 'index.html'
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - run: pip install -r requirements.txt
+
+      - name: Run smoke tests
+        run: python tests/test_smoke.py
+
+      - name: Install Chromium for visual QA
+        run: playwright install --with-deps chromium
+
+      - name: Run visual QA
+        run: python scripts/visual_qa.py --screenshots
+
+      - name: Upload screenshots
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-qa-screenshots
+          path: data/screenshots/
+          retention-days: 7

@@ -1,0 +1,228 @@
+name: Weekly Macro Update
+
+on:
+  schedule:
+    # Weekly data pull: every Saturday 8am ET (12:00 UTC)
+    - cron: '0 12 * * 6'
+    # Second cron `0 14 8-14 * 6` removed 2026-05-14 — cron OR-semantics
+    # on DoM+DoW caused it to fire DAILY during days 8-14 of each month
+    # instead of "2nd Saturday only" as intended. The weekly cron above
+    # already covers every Saturday including the 2nd one. If a genuinely
+    # different deep-refresh behaviour is needed later, gate it inside
+    # the job (e.g. `[ $(date -u +%d) -le 14 ]`) rather than a 2nd cron.
+  workflow_dispatch:
+    inputs:
+      force_ai:
+        description: 'Force Agent 3 (Claude AI) to run'
+        required: false
+        default: 'true'
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
+
+      - name: Check setup
+        run: |
+          echo "FRED key set:   ${{ secrets.FRED_API_KEY != '' }}"
+          echo "BLS key set:    ${{ secrets.BLS_API_KEY != '' }}"
+          echo "EIA key set:    ${{ secrets.EIA_API_KEY != '' }}"
+          echo "Claude key set:  ${{ secrets.ANTHROPIC_API_KEY != '' }}"
+          echo "Resend key set:  ${{ secrets.RESEND_API_KEY != '' }}"
+          ls scripts/
+          ls data/ || echo "data/ missing"
+
+      - name: Agent 0 — Pre-flight (FRED + Anthropic model validation)
+        env:
+          FRED_API_KEY:      ${{ secrets.FRED_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python scripts/preflight.py
+
+      - name: Agent 1 — Collector
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY:  ${{ secrets.BLS_API_KEY }}
+          EIA_API_KEY:  ${{ secrets.EIA_API_KEY }}
+        run: python scripts/collector.py
+
+      - name: Agent 2 — Analyzer
+        run: python scripts/analyzer.py
+
+      - name: Agent 3 — Analyst (claude-sonnet-4-6)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          FORCE_AI: ${{ github.event.inputs.force_ai || 'false' }}
+        run: |
+          # Run AI commentary on every scheduled run (weekly + monthly)
+          # All runs now generate fresh commentary from latest data
+          echo "Running Agent 3 — AI commentary refresh"
+          python scripts/briefing_agent.py
+
+      - name: Agent 4 — Renderer
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+        run: python scripts/renderer.py
+
+      - name: Agent 6 — Validator
+        id: validator
+        env:
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          BLS_API_KEY:  ${{ secrets.BLS_API_KEY }}
+        run: python scripts/validator.py
+        continue-on-error: true
+
+      - name: Agent 10 — Repair Agent (observer mode)
+        if: always()
+        run: python scripts/repair_agent.py
+        continue-on-error: true
+
+      - name: Agent 4b — Re-render (inject validation report)
+        run: python scripts/renderer.py
+
+      - name: Gate — Block publish on critical validation failures
+        if: steps.validator.outcome == 'failure'
+        run: |
+          echo "❌ Validator detected critical data divergences."
+          echo "   Review data/validation_report.json for details."
+          echo "   Pipeline halted — fix data quality issues before publishing."
+          exit 1
+
+      - name: Snapshot — Rolling data backup (keep last 3)
+        run: python scripts/snapshot.py
+
+      - name: Monthly Archive — durable historical record (never pruned)
+        # Distinct from the Snapshot step above: that one is capped/rolling
+        # (operational rollback only). This upserts a permanent per-month
+        # record. Never allowed to fail the run — see the script's own
+        # internal try/except, backstopped here by continue-on-error.
+        continue-on-error: true
+        run: python scripts/monthly_archive.py
+
+      - name: Version Tracker — Record pipeline run
+        run: python scripts/version_tracker.py
+
+      - name: Agent 5 — Publisher
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM:     ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:       ${{ secrets.EMAIL_TO }}
+        run: python scripts/publisher.py
+
+      - name: Commit and push
+        run: |
+          git config user.name  "briefing-bot"
+          git config user.email "briefing-bot@users.noreply.github.com"
+          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}
+          git add index.html data/ version.json
+          if git diff --staged --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "📊 Weekly update: $(date -u +'%Y-%m-%d')"
+            pushed=false
+            for attempt in 1 2 3; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "Push attempt $attempt failed, retrying in 5s..."
+              sleep 5
+            done
+            if [ "$pushed" != "true" ]; then
+              echo "::error::Weekly update commit could not be pushed after 3 attempts — check for uncommitted files outside the 'index.html data/ version.json' git-add scope (a leftover unstaged file will make every rebase fail like this, silently, forever)."
+              exit 1
+            fi
+          fi
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: '.'
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v4
+
+      - name: Health Check — Verify deployed page
+        id: healthcheck
+        if: steps.deploy.outputs.page_url
+        run: python scripts/healthcheck.py "${{ steps.deploy.outputs.page_url }}"
+
+      - name: Auto-rollback on health check failure
+        if: failure() && steps.healthcheck.outcome == 'failure'
+        run: |
+          echo "⚠️ Health check failed — attempting auto-rollback"
+          python scripts/snapshot.py --rollback "$(ls -1 data/snapshots/ 2>/dev/null | sort -r | head -1)" || echo "No snapshot available for rollback"
+          python scripts/renderer.py
+          git add index.html data/ version.json
+          if ! git diff --staged --quiet; then
+            git commit -m "🔄 Auto-rollback: health check failed $(date -u +'%Y-%m-%d')"
+            pushed=false
+            for attempt in 1 2 3; do
+              if git pull --rebase origin main && git push origin HEAD:main; then
+                pushed=true
+                break
+              fi
+              echo "Push attempt $attempt failed, retrying in 5s..."
+              sleep 5
+            done
+            if [ "$pushed" != "true" ]; then
+              echo "::error::Auto-rollback commit could not be pushed after 3 attempts — check for uncommitted files outside the 'index.html data/ version.json' git-add scope."
+              exit 1
+            fi
+          fi
+
+  # ── Pipeline failure notification ──────────────────────────────────
+  notify-failure:
+    runs-on: ubuntu-latest
+    needs: update
+    if: failure()
+    permissions:
+      issues: write
+    steps:
+      - name: Notify pipeline failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `Pipeline failure: ${new Date().toISOString().slice(0,10)}`;
+            const body = [
+              '## Pipeline Failure Alert',
+              '',
+              `**Run:** [${context.runId}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})`,
+              `**Trigger:** ${context.eventName}`,
+              `**Time:** ${new Date().toISOString()}`,
+              '',
+              'Review the failed run and fix before next scheduled execution.',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: ['pipeline-failure'],
+            });
